@@ -1,6 +1,7 @@
 import os
 from cryptography.hazmat.primitives import padding
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 # ===== Encabezado sencillo para autodescribir los .enc =====
 HEADER_MAGIC = "P4Y1"  # Marca del formato
@@ -29,9 +30,13 @@ def _parse_header(blob: bytes):
     return modo, key_bits, resto
 
 # ===== Utilidades AES =====
-def generar_clave(longitud_bits):
-    """Genera una clave AES aleatoria según la longitud en bits (128, 192 o 256)."""
-    return os.urandom(longitud_bits // 8)
+def generar_clave(longitud_bits: int) -> bytes:
+    """
+    Genera una clave AES aleatoria de 128, 192 o 256 bits usando cryptography.
+    """
+    if longitud_bits not in (128, 192, 256):
+        raise ValueError("La longitud de clave debe ser 128, 192 o 256 bits.")
+    return AESGCM.generate_key(bit_length=longitud_bits)
 
 def _cipher_from_mode(clave: bytes, modo_upper: str, iv: bytes) -> Cipher:
     if modo_upper == "CBC":
