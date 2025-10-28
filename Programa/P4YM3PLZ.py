@@ -1,5 +1,6 @@
 import os
 import base64
+import secrets  
 from getpass import getpass
 from typing import Tuple, Optional
 
@@ -171,7 +172,7 @@ def cifrar_archivo(ruta_entrada: str, modo: str, key_bits: int, public_key_pem_p
     with open(ruta_entrada, "rb") as f:
         datos = f.read()
 
-    iv = os.urandom(16)
+    iv = secrets.token_bytes(16)
     modo_upper = modo.upper()
     if modo_upper == "CBC":
         padder = sym_padding.PKCS7(128).padder()
