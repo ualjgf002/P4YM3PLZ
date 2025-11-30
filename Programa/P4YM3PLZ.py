@@ -14,6 +14,8 @@ from cryptography.hazmat.backends import default_backend
 # ===== Encabezado para .p4ym3 con clave envuelta =====
 HEADER_MAGIC = "P4Y1"
 PKALG_RSA_OAEP_SHA256 = "RSA_OAEP_SHA256"
+SIGALG_RSA_PSS_SHA256 = "RSA_PSS_SHA256"
+
 
 
 def _make_header_line1(modo: str, key_bits: int, pk_alg: str) -> bytes:
@@ -29,12 +31,9 @@ def _make_header_line2_wrapped_key_b64(wrapped_key: bytes) -> bytes:
     """
     return (base64.b64encode(wrapped_key) + b"\n")
 
-
+"""
 def _parse_header_2lines(blob: bytes):
-    """
-    Lee las dos primeras líneas ASCII del blob.
-    Devuelve (modo, key_bits, pk_alg, wrapped_key_bytes, resto_bytes).
-    """
+   
     nl1 = blob.find(b"\n")
     if nl1 == -1:
         raise ValueError("Archivo sin encabezado: falta línea 1.")
@@ -61,6 +60,73 @@ def _parse_header_2lines(blob: bytes):
 
     resto = rem[nl2 + 1:]
     return modo, key_bits, pk_alg, wrapped_key, resto
+"""
+def _parse_header_2lines(blob: bytes):
+    """
+    Lee encabezado ASCII:
+    L1: P4Y1|<MODO>|<KEYBITS>|PKALG=<ALG>
+    L2: <WRAPPED_KEY_BASE64>
+    (opcional)
+    L3: SIGALG=<ALGO>
+    L4: <FIRMA_BASE64>
+    Devuelve (modo, key_bits, pk_alg, wrapped_key_bytes, sig_alg, firma_bytes, resto_bytes).
+    """
+    # ---- Línea 1 ----
+    nl1 = blob.find(b"\n")
+    if nl1 == -1:
+        raise ValueError("Archivo sin encabezado: falta línea 1.")
+    line1 = blob[:nl1].decode("ascii", errors="strict")
+    parts = line1.split("|")
+    if len(parts) < 3 or parts[0] != HEADER_MAGIC:
+        raise ValueError("Encabezado (línea 1) no válido.")
+    modo = parts[1].upper()
+    key_bits = int(parts[2])
+    pk_alg = PKALG_RSA_OAEP_SHA256  # por defecto
+    if len(parts) >= 4 and parts[3].startswith("PKALG="):
+        pk_alg = parts[3].split("=", 1)[1]
+
+    # ---- Línea 2: wrapped key base64 ----
+    rem = blob[nl1 + 1:]
+    nl2 = rem.find(b"\n")
+    if nl2 == -1:
+        raise ValueError("Archivo sin encabezado: falta línea 2 con clave envuelta.")
+    line2 = rem[:nl2]
+    try:
+        wrapped_key = base64.b64decode(line2, validate=True)
+    except Exception as e:
+        raise ValueError("Línea 2 no es base64 válido para clave envuelta.") from e
+
+    resto = rem[nl2 + 1:]  # aquí puede empezar SIGALG=... o directamente IV
+
+    sig_alg = None
+    firma = None
+
+    # ¿Hay línea de firma?
+    if resto.startswith(b"SIGALG="):
+        # ---- Línea 3: SIGALG=... ----
+        nl3 = resto.find(b"\n")
+        if nl3 == -1:
+            raise ValueError("Encabezado de firma incompleto: falta salto de línea tras SIGALG.")
+        line3 = resto[:nl3].decode("ascii", errors="strict")
+        sig_alg = line3.split("=", 1)[1]
+
+        # ---- Línea 4: firma base64 ----
+        rem2 = resto[nl3 + 1:]
+        nl4 = rem2.find(b"\n")
+        if nl4 == -1:
+            raise ValueError("Encabezado de firma incompleto: falta línea con la firma.")
+        line4 = rem2[:nl4]
+        try:
+            firma = base64.b64decode(line4, validate=True)
+        except Exception as e:
+            raise ValueError("La línea de firma no contiene base64 válido.") from e
+
+        resto = rem2[nl4 + 1:]  # a partir de aquí: IV + ciphertext
+
+    return modo, key_bits, pk_alg, wrapped_key, sig_alg, firma, resto
+
+
+
 
 
 # ===== Utilidades RSA (Tarea 3) =====
@@ -118,6 +184,34 @@ def unwrap_key_rsa_oaep(privkey, wrapped: bytes) -> bytes:
         ),
     )
 
+def firmar_datos_rsa_pss(privkey, data: bytes) -> bytes:
+    """Firma data con RSA-PSS + SHA-256."""
+    return privkey.sign(
+        data,
+        asym_padding.PSS(
+            mgf=asym_padding.MGF1(hashes.SHA256()),
+            salt_length=asym_padding.PSS.MAX_LENGTH,
+        ),
+        hashes.SHA256(),
+    )
+
+
+def verificar_firma_rsa_pss(pubkey, data: bytes, firma: bytes) -> bool:
+    """Verifica firma RSA-PSS + SHA-256. Devuelve True/False."""
+    try:
+        pubkey.verify(
+            firma,
+            data,
+            asym_padding.PSS(
+                mgf=asym_padding.MGF1(hashes.SHA256()),
+                salt_length=asym_padding.PSS.MAX_LENGTH,
+            ),
+            hashes.SHA256(),
+        )
+        return True
+    except Exception:
+        return False
+
 
 # ===== Utilidades AES (Tarea 2) =====
 def generar_clave(longitud_bits: int) -> bytes:
@@ -159,7 +253,14 @@ def _out_path_same_name_with_ext(input_path: str, suffix: str = "") -> str:
 
 
 # ===== Cifrar / Descifrar (híbrido) =====
-def cifrar_archivo(ruta_entrada: str, modo: str, key_bits: int, public_key_pem_path: str) -> str:
+def cifrar_archivo(
+    ruta_entrada: str,
+    modo: str,
+    key_bits: int,
+    public_key_pem_path: str,
+    sign_private_key_pem_path: Optional[str] = None,
+    sign_private_key_password: Optional[str] = None,
+) -> str:
     """
     Cifra un archivo (AES modo seleccionado) y envuelve la clave simétrica con la
     clave pública RSA (OAEP-SHA256). Escribe:
@@ -190,12 +291,20 @@ def cifrar_archivo(ruta_entrada: str, modo: str, key_bits: int, public_key_pem_p
     encryptor = cipher.encryptor()
     datos_cifrados = encryptor.update(datos) + encryptor.finalize()
 
+    # 3.1) Firmar (opcional) IV + ciphertext con la clave privada del EMISOR
+    extra_header = b""
+    if sign_private_key_pem_path is not None:
+        priv_sign = cargar_private_key_pem(sign_private_key_pem_path, sign_private_key_password)
+        firma = firmar_datos_rsa_pss(priv_sign, iv + datos_cifrados)
+        extra_header += f"SIGALG={SIGALG_RSA_PSS_SHA256}\n".encode("ascii")
+        extra_header += base64.b64encode(firma) + b"\n"
+
     # 4) Construir salida
     header1 = _make_header_line1(modo_upper, len(clave) * 8, PKALG_RSA_OAEP_SHA256)
     header2 = _make_header_line2_wrapped_key_b64(wrapped)
     ruta_salida = _out_path_same_name_with_ext(ruta_entrada, suffix="")
     with open(ruta_salida, "wb") as f:
-        f.write(header1 + header2 + iv + datos_cifrados)
+        f.write(header1 + header2 + extra_header + iv + datos_cifrados)
 
     print(f"Archivo cifrado: {ruta_salida}")
     print(f"IV utilizado: {iv.hex()}\nClave simétrica (no se muestra por seguridad). Clave envuelta: {len(wrapped)} bytes.")
@@ -213,22 +322,40 @@ def descifrar_archivo(ruta_entrada: str, private_key_pem_path: str, private_key_
     with open(ruta_entrada, "rb") as f:
         blob = f.read()
 
-    modo_upper, key_bits, pk_alg, wrapped_key, resto = _parse_header_2lines(blob)
+    modo_upper, key_bits, pk_alg, wrapped_key, sig_alg, firma, resto = _parse_header_2lines(blob)
     if pk_alg != PKALG_RSA_OAEP_SHA256:
         raise ValueError(f"Algoritmo de clave pública no soportado en este fichero: {pk_alg}")
-
-    # 1) Desenvolver la clave simétrica
-    privkey = cargar_private_key_pem(private_key_pem_path, private_key_password)
-    clave = unwrap_key_rsa_oaep(privkey, wrapped_key)
-    if len(clave) * 8 != key_bits:
-        raise ValueError(f"La clave simétrica envuelta es de {len(clave)*8} bits y no coincide con {key_bits} bits esperados.")
 
     # 2) Separar IV y ciphertext
     if len(resto) < 16:
         raise ValueError("Archivo corrupto: faltan bytes para el IV.")
     iv, datos_cifrados = resto[:16], resto[16:]
 
-    # 3) Descifrar
+    # 2.1) Verificar firma digital (si existe)
+    if sig_alg is not None:
+        print(f"El fichero lleva firma digital ({sig_alg}).")
+        pub_sign_path = input("Ruta a la clave PÚBLICA RSA del EMISOR (para verificar la firma): ").strip().strip('"')
+        if not os.path.isfile(pub_sign_path):
+            print("No se ha encontrado la clave pública del emisor. NO se puede verificar la firma.")
+        else:
+            pub_sign = cargar_public_key_pem(pub_sign_path)
+            if sig_alg == SIGALG_RSA_PSS_SHA256:
+                ok = verificar_firma_rsa_pss(pub_sign, iv + datos_cifrados, firma)
+            else:
+                ok = False
+
+            if ok:
+                print("Firma digital VÁLIDA. El fichero proviene del emisor esperado y no ha sido modificado.")
+            else:
+                print("¡¡ADVERTENCIA!! Firma digital NO VÁLIDA. El fichero puede haber sido manipulado.")
+
+    # 3) Desenvolver la clave simétrica
+    privkey = cargar_private_key_pem(private_key_pem_path, private_key_password)
+    clave = unwrap_key_rsa_oaep(privkey, wrapped_key)
+    if len(clave) * 8 != key_bits:
+        raise ValueError(f"La clave simétrica envuelta es de {len(clave)*8} bits y no coincide con {key_bits} bits esperados.")
+
+    # 4) Descifrar
     cipher = _cipher_from_mode(clave, modo_upper, iv)
     decryptor = cipher.decryptor()
     datos = decryptor.update(datos_cifrados) + decryptor.finalize()
@@ -292,8 +419,21 @@ def main():
         if not os.path.isfile(pub_path):
             print("No se ha encontrado la clave pública.")
             return
+        
+        want_sig = input("¿Quieres añadir FIRMA DIGITAL con otra clave RSA? (S/N): ").strip().upper()
+        sign_priv_path = None
+        sign_pw = None
+        if want_sig == "S":
+            sign_priv_path = input("Ruta a la clave PRIVADA RSA del EMISOR (para firmar): ").strip().strip('"')
+            if not os.path.isfile(sign_priv_path):
+                print("No se ha encontrado la clave privada del emisor. No se firmará el fichero.")
+                sign_priv_path = None
+            else:
+                need_pw_sign = input("¿Esa clave privada tiene contraseña? (S/N): ").strip().upper()
+                if need_pw_sign == "S":
+                    sign_pw = getpass("Introduce la contraseña de la clave privada del emisor: ")
 
-        cifrar_archivo(ruta_entrada, modo, key_bits, pub_path)
+        cifrar_archivo(ruta_entrada, modo, key_bits, pub_path, sign_priv_path, sign_pw)
 
     elif accion == "D":
         priv_path = input("Ruta a la clave PRIVADA RSA (PEM): ").strip().strip('"')
