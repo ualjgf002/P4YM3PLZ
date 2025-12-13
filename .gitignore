@@ -1,0 +1,28 @@
+# Private RSA keys - NEVER commit these
+*_private.pem
+rsa_private.pem
+rsa_private_*.pem
+
+# Build artifacts
+/build/
+/dist/
+*.pyc
+__pycache__/
+*.egg-info/
+.venv/
+.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test artifacts
+test_*.p4ym3
+test_*_descifrado
+*.p4ym3
