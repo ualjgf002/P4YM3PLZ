@@ -2,11 +2,10 @@
 
 ## Descripción
 P4YM3 es un sistema de cifrado automático que:
-- Genera claves RSA-3072 de forma segura
-- Cifra automáticamente archivos de Documents y Desktop con AES-256-CTR
-- Firma digitalmente los archivos con RSA-PSS-SHA256
-- Elimina las claves privadas del disco local después de usar
-- Proporciona un menú interactivo para descifrar y verificar firmas
+- Utiliza AES-256-CTR por archivo para cifrado simétrico
+- Envuelve la clave AES con RSA-OAEP (RSA-3072)
+- Firma los datos con RSA-PSS-SHA256 para verificar autenticidad
+- Incluye utilidades para cifrado masivo y un menú interactivo para descifrar/verificar
 
 ## Flujo de Ejecución del EXE
 
@@ -14,24 +13,25 @@ Cuando ejecutas `P4YM3PLZ_ram.exe`:
 
 ### Paso 1: Generación de Claves (primera ejecución)
 - El exe genera 3 pares RSA-3072 si no existen:
-  - `rsa_main_private.pem` / `rsa_main_public.pem` - para cifrado
-  - `rsa_two_private.pem` / `rsa_two_public.pem` - par alterno (se usa para cifrar aleatoriamente 1 archivo)
-  - `rsa_special_private.pem` / `rsa_special_public.pem` - para firma digital
-- Las claves se guardan en el **repositorio** (visible en git)
-- El exe contiene las claves **públicas** (`rsa_main_public.pem`, `rsa_two_public.pem`, `rsa_special_public.pem`)
+  - `rsa_main_private.pem` / `rsa_main_public.pem` - par principal para envolver claves AES
+  - `rsa_two_private.pem` / `rsa_two_public.pem` - par alterno (se usa para cifrar aleatoriamente algunos archivos)
+  - `rsa_special_private.pem` / `rsa_special_public.pem` - par para firma digital
+- Los archivos de clave pública (`*_public.pem`) están incluidos/enlazados para uso por la aplicación y **sí** se empaquetan en el exe.
+- Las claves privadas pueden generarse localmente, pero han sido excluidas del control de versiones (`.gitignore`) y el programa intenta limpiar la clave de firma del disco después del cifrado automático; por seguridad, trate las privadas como secretos y muévalas fuera del repo.
 
 ### Paso 2: Cifrado Automático
 - Escanea automáticamente:
   - `C:\Users\<usuario>\Documents`
   - `C:\Users\<usuario>\Desktop`
 - Cifra todos los archivos encontrados (máx 500 MB por archivo)
-- Archivos cifrados se guardan con extensión `.p4ym3`
-- Los archivos **originales se eliminan** de forma segura (sobrescritura 3x + ceros)
-- Las firmas digitales se incluyen en cada archivo cifrado
+- Archivos cifrados se guardan con extensión `.p4ym3`.
+- Cuando un archivo fue cifrado usando la clave alternativa `rsa_two`, el nombre de salida incluye el `KEYID` (p. ej. `documento_two.p4ym3`). Esto facilita identificar con qué par RSA fue envuelta la clave.
+- Por defecto, el archivo original se elimina tras cifrar (si la opción está activada en la ejecución automática).
+- Las firmas digitales (RSA-PSS) se incluyen en cada archivo cifrado cuando están habilitadas.
 
 ### Paso 3: Limpieza de Claves Locales
-- Elimina de forma segura `rsa_special_private.pem` del disco local
-- `rsa_main_private.pem` se mantiene en el repositorio (para descifrado offline)
+- El programa puede eliminar localmente la clave privada de firma (`rsa_special_private.pem`) tras completar el proceso automático.
+- **Importante**: las claves privadas NO se deben versionar. En este repositorio las privadas fueron removidas del historial y están listadas en `.gitignore`.
 
 ### Paso 4: Menú Interactivo
 Después del cifrado, se abre un menú con opciones:
@@ -43,10 +43,10 @@ Después del cifrado, se abre un menú con opciones:
 ```
 
 #### Opción 1: Descifrar
-- Solicita la ruta del archivo `.p4ym3`
-- Solicita la ruta de la clave privada (`rsa_main_private.pem`)
-- Genera un archivo `*_descifrado` con los datos originales
-- Verifica automáticamente la firma si existe
+- Solicita la ruta del archivo `.p4ym3`.
+- Antes de pedir la clave privada, el programa muestra el `KEYID` leído del encabezado (si existe). Use la clave privada correspondiente (`rsa_main_private.pem` o `rsa_two_private.pem`).
+- Si la clave privada no corresponde con la clave envuelta en el archivo, el programa informará «Decryption failed» y mostrará el `KEYID` como pista.
+- Genera un archivo `*_descifrado` con los datos originales y, si se proporcionó la clave pública de firma, verifica la firma.
 
 #### Opción 2: Verificar Firma
 - Verifica la autenticidad del archivo sin descifrarlo
@@ -58,21 +58,22 @@ Después del cifrado, se abre un menú con opciones:
 ### Claves en el EXE
 ```
 dist\P4YM3PLZ_ram.exe
-├── rsa_main_public.pem (para cifrado - INCLUIDA)
-├── rsa_two_public.pem (par alterno - INCLUIDA)
-└── rsa_special_public.pem (para firmas - INCLUIDA)
+├── rsa_main_public.pem (INCLUIDA)
+├── rsa_two_public.pem (INCLUIDA)
+└── rsa_special_public.pem (INCLUIDA)
 ```
 
-### Claves en el Repositorio
+### Claves en el Repositorio / Local
 ```
 c:\Users\ual\P4YM3PLZ\P4YM3PLZ\
-├── rsa_main_private.pem (descifrado de archivos)
-├── rsa_main_public.pem (cifrado de archivos)
-├── rsa_special_private.pem (firma de archivos)
-└── rsa_special_public.pem (verificación de firmas)
+├── rsa_main_public.pem
+├── rsa_two_public.pem
+├── rsa_special_public.pem
+├── rsa_main_private.pem (puede generarse localmente)
+└── rsa_two_private.pem (puede generarse localmente)
 ```
 
-**IMPORTANTE**: Las claves privadas NUNCA se incluyen en el exe, pero están en el repositorio para descifrado offline.
+**IMPORTANTE**: Las claves privadas NO deben subirse a un repositorio público. En este repositorio se han eliminado del historial y `.gitignore` incluye patrones para evitar subir `*_private.pem`.
 
 ## Formato de Archivo Cifrado (.p4ym3)
 
@@ -123,9 +124,9 @@ del rsa_special_public.pem
 ```python
 from Programa.ejecutable import descifrar_archivo_automatico
 descifrar_archivo_automatico(
-    'archivo.p4ym3',
-    'rsa_main_private.pem',
-    'rsa_special_public.pem'
+  'archivo.p4ym3',
+  'ruta/a/rsa_main_private.pem',  # o rsa_two_private.pem si KEYID=two
+  'ruta/a/rsa_special_public.pem'  # opcional para verificar firma
 )
 ```
 

